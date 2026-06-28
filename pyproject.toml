@@ -1,0 +1,20 @@
+[project]
+name = "md2doc"
+version = "0.1.0"
+description = "使用 pandoc 将 Markdown 文件转换为符合公文格式规范的 Word (.docx) 文件"
+requires-python = ">=3.12"
+dependencies = [
+    "python-docx>=1.1.0",
+    "lxml>=5.0.0",
+    "mcp>=1.0.0",
+]
+
+[project.scripts]
+md2doc-mcp = "md2doc.mcp_server:main"
+
+[tool.uv]
+index-url = "https://mirrors.aliyun.com/pypi/simple"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
