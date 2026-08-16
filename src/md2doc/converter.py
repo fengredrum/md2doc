@@ -213,12 +213,26 @@ def convert(
     # ── Post-processing ──
     if not skip_format:
         with redirect_stdout(io.StringIO()):
-            post_process_docx(str(output_path), format_spec)
+            post_process_docx(
+                str(output_path),
+                format_spec,
+                reference_docx_path=str(reference_docx) if reference_docx else None,
+            )
 
     # ── Insert HTML tables ──
     if html_tables:
         with redirect_stdout(io.StringIO()):
             _insert_html_tables(str(output_path), html_tables, format_spec)
+
+    # ── Copy template table formatting (must run after HTML table insertion) ──
+    if not skip_format and reference_docx and reference_docx.exists():
+        with redirect_stdout(io.StringIO()):
+            _core._copy_template_formatting(
+                str(output_path),
+                str(reference_docx),
+                copy_paragraphs=False,
+                copy_tables=True,
+            )
 
     # ── Cleanup temp file ──
     if temp_md is not None:

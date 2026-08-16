@@ -56,8 +56,9 @@ def _check_pydocx():
 class HTMLTableParser(HTMLParser):
     """解析 HTML <table> 元素，提取结构化数据（含 colspan/rowspan）。
 
-    处理 <table>, <tr>, <td>, <th>, <br> 标签，
+    处理 <table>, <tr>, <td>, <th>, <br>, <b> 标签，
     以及 HTML 实体 (&nbsp;, &#160; 等)。
+    支持内联 <b> 粗体标记，通过 segments 字段保留粗体/非粗体文本段。
     """
 
     def __init__(self):
@@ -69,6 +70,34 @@ class HTMLTableParser(HTMLParser):
         self._in_table = False
         self._in_row = False
         self._in_cell = False
+        self._in_bold = False
+        # 部分段列表: [{'text': ..., 'bold': bool}, ...]
+        self._segments = []
+
+    def _append_text(self, text):
+        """将文本追加到当前段。当前没有段时自动创建。"""
+        if not self._segments:
+            self._segments.append({'text': '', 'bold': self._in_bold})
+        # 若粗体状态变化则创建新段
+        if self._segments[-1]['bold'] != self._in_bold:
+            self._segments.append({'text': '', 'bold': self._in_bold})
+        self._segments[-1]['text'] += text
+
+    def _finalize_segments(self):
+        """收尾部分段：清理空白、合并相邻同粗体状态段、构建纯文本。"""
+        # 1. 清理每个段的文本空白
+        for seg in self._segments:
+            seg['text'] = re.sub(r'[ \t]+', ' ', seg['text']).strip()
+        # 2. 过滤空段
+        self._segments = [s for s in self._segments if s['text']]
+        # 3. 合并相邻同状态段
+        merged = []
+        for seg in self._segments:
+            if merged and merged[-1]['bold'] == seg['bold']:
+                merged[-1]['text'] += seg['text']
+            else:
+                merged.append(seg)
+        self._segments = merged
 
     def handle_starttag(self, tag, attrs):
         attrs_dict = dict(attrs)
@@ -82,15 +111,19 @@ class HTMLTableParser(HTMLParser):
             self._in_cell = True
             colspan = int(attrs_dict.get('colspan', 1))
             rowspan = int(attrs_dict.get('rowspan', 1))
+            self._segments = []
+            self._in_bold = False
             self._current_cell = {
                 'text': '',
+                'segments': [],
                 'colspan': colspan,
                 'rowspan': rowspan,
                 'is_header': (tag == 'th'),
             }
+        elif tag == 'b' and self._in_cell:
+            self._in_bold = True
         elif tag == 'br' and self._in_cell:
-            if self._current_cell is not None:
-                self._current_cell['text'] += '\n'
+            self._append_text('\n')
 
     def handle_endtag(self, tag):
         if tag == 'table' and self._in_table:
@@ -106,16 +139,21 @@ class HTMLTableParser(HTMLParser):
         elif tag in ('td', 'th') and self._in_cell:
             self._in_cell = False
             if self._current_row is not None and self._current_cell is not None:
-                # 清理文本: 合并连续空白，去除首尾空白
-                text = self._current_cell['text'].strip()
-                text = re.sub(r'[ \t]+', ' ', text)
-                self._current_cell['text'] = text
+                self._finalize_segments()
+                self._current_cell['segments'] = self._segments
+                # 构建兼容纯文本字段（保留向后兼容）
+                full_text = ''.join(s['text'] for s in self._segments)
+                self._current_cell['text'] = full_text
                 self._current_row.append(self._current_cell)
             self._current_cell = None
+            self._segments = []
+            self._in_bold = False
+        elif tag == 'b' and self._in_cell:
+            self._in_bold = False
 
     def handle_data(self, data):
         if self._in_cell and self._current_cell is not None:
-            self._current_cell['text'] += data
+            self._append_text(data)
 
     def handle_entityref(self, name):
         """处理命名实体如 &nbsp; &lt; &gt; &amp;"""
@@ -124,7 +162,7 @@ class HTMLTableParser(HTMLParser):
             'quot': '"', 'apos': "'",
         }
         if self._in_cell and self._current_cell is not None:
-            self._current_cell['text'] += entity_map.get(name, f'&{name};')
+            self._append_text(entity_map.get(name, f'&{name};'))
 
     def handle_charref(self, name):
         """处理数字字符引用如 &#160; &#x4E2D;"""
@@ -136,7 +174,7 @@ class HTMLTableParser(HTMLParser):
         except (ValueError, OverflowError):
             char = f'&#{name};'
         if self._in_cell and self._current_cell is not None:
-            self._current_cell['text'] += char
+            self._append_text(char)
 
     def error(self, message):
         """静默忽略 HTML 解析错误。"""
@@ -861,19 +899,36 @@ def _create_word_table(doc, table_data, format_spec=None):
                 _clear_first_line_indent(pPr)
 
             if cell_text:
-                lines = cell_text.split('\n')
-                for i, line in enumerate(lines):
-                    # 清理多余空格（合并连续空白，去除首尾空白）
-                    clean_line = re.sub(r'\s+', ' ', line).strip()
-                    run = first_para.add_run(clean_line if clean_line else ' ')
-                    run.font.name = table_font
-                    run.font.size = Pt(table_size_pt)
-                    if is_header:
-                        run.bold = True
-                    _set_east_asian_font(run._element, table_font)
-                    # 在每行（除最后一行）末尾添加换行符
-                    if i < len(lines) - 1:
-                        run.add_break()
+                segments = cell_data.get('segments', [])
+                if segments:
+                    # 使用 segments 保留内联粗体标记
+                    for seg in segments:
+                        lines = seg['text'].split('\n')
+                        for i, line in enumerate(lines):
+                            clean_line = re.sub(r'\s+', ' ', line).strip()
+                            if not clean_line:
+                                continue
+                            run = first_para.add_run(clean_line)
+                            run.font.name = table_font
+                            run.font.size = Pt(table_size_pt)
+                            if seg['bold'] or is_header:
+                                run.bold = True
+                            _set_east_asian_font(run._element, table_font)
+                            if i < len(lines) - 1:
+                                run.add_break()
+                else:
+                    # 向后兼容：无 segments 时按行分割
+                    lines = cell_text.split('\n')
+                    for i, line in enumerate(lines):
+                        clean_line = re.sub(r'\s+', ' ', line).strip()
+                        run = first_para.add_run(clean_line if clean_line else ' ')
+                        run.font.name = table_font
+                        run.font.size = Pt(table_size_pt)
+                        if is_header:
+                            run.bold = True
+                        _set_east_asian_font(run._element, table_font)
+                        if i < len(lines) - 1:
+                            run.add_break()
             else:
                 # 空单元格：需要一个空 run 满足 Word 最小内容要求
                 run = first_para.add_run(' ')
@@ -1020,7 +1075,340 @@ def _fix_image_paragraph_spacing(doc, format_spec=None):
         # 保留 before/after 让 Word 自行排版
 
 
-def post_process_docx(output_path, format_spec=None):
+def _get_content_elements(doc):
+    """遍历 body 元素，返回内容承载元素列表（跳过纯空白段落）。
+
+    按文档顺序遍历 w:body 的直接子元素（w:p 和 w:tbl），
+    过滤掉仅包含空白字符的段落，保留表格和含文本的段落。
+
+    Args:
+        doc: python-docx Document 对象
+
+    Returns:
+        [{'type': 'paragraph', 'para': Paragraph, 'element': lxml Element}, ...]
+    """
+    from docx.oxml.ns import qn
+
+    # 构建 python-docx 对象到 lxml 元素的映射
+    para_by_elem = {}
+    for p in doc.paragraphs:
+        para_by_elem[id(p._element)] = p
+
+    table_by_elem = {}
+    for t in doc.tables:
+        table_by_elem[id(t._tbl)] = t
+
+    elements = []
+    body = doc.element.body
+
+    for child in body:
+        tag = child.tag.split('}')[-1] if '}' in child.tag else child.tag
+
+        if tag == 'p':
+            para = para_by_elem.get(id(child))
+            if para is None:
+                continue
+            # 跳过纯空白段落（用于模版中作垂直间距的空白段落）
+            text = para.text.strip() if para.text else ''
+            has_content = bool(text) or any(
+                r.text and r.text.strip() for r in para.runs
+            )
+            if has_content:
+                elements.append({'type': 'paragraph', 'para': para, 'element': child})
+        elif tag == 'tbl':
+            table = table_by_elem.get(id(child))
+            if table is not None:
+                elements.append({'type': 'table', 'table': table, 'element': child})
+
+    return elements
+
+
+def _copy_paragraph_format(tpl_para, out_para):
+    """从模版段落复制格式到输出段落。
+
+    复制段落级属性（对齐、缩进、间距）和 run 级属性（字体名称、大小），
+    但保留输出中已有的粗体/斜体标记，以维护 Markdown 语义格式。
+
+    Args:
+        tpl_para: 模版 python-docx Paragraph 对象
+        out_para: 输出 python-docx Paragraph 对象
+    """
+    from docx.oxml.ns import qn
+    from lxml import etree
+
+    # ── 段落级属性 ──
+    tpl_pPr = tpl_para._element.find(qn('w:pPr'))
+    out_pPr = out_para._element.find(qn('w:pPr'))
+
+    if tpl_pPr is not None and out_pPr is not None:
+        # 段落对齐 w:jc
+        tpl_jc = tpl_pPr.find(qn('w:jc'))
+        if tpl_jc is not None:
+            out_jc = out_pPr.find(qn('w:jc'))
+            if out_jc is None:
+                out_jc = etree.SubElement(out_pPr, qn('w:jc'))
+            out_jc.set(qn('w:val'), tpl_jc.get(qn('w:val')))
+
+        # 段落缩进 w:ind
+        tpl_ind = tpl_pPr.find(qn('w:ind'))
+        if tpl_ind is not None:
+            out_ind = out_pPr.find(qn('w:ind'))
+            if out_ind is None:
+                out_ind = etree.SubElement(out_pPr, qn('w:ind'))
+            for attr_name, attr_val in tpl_ind.attrib.items():
+                out_ind.set(attr_name, attr_val)
+
+        # 段落间距 w:spacing
+        tpl_spacing = tpl_pPr.find(qn('w:spacing'))
+        if tpl_spacing is not None:
+            out_spacing = out_pPr.find(qn('w:spacing'))
+            if out_spacing is None:
+                out_spacing = etree.SubElement(out_pPr, qn('w:spacing'))
+            for attr_name, attr_val in tpl_spacing.attrib.items():
+                out_spacing.set(attr_name, attr_val)
+
+    # ── Run 级属性（按位置匹配：输出 run N 应用模版 run N 的格式） ──
+    # 若输出 run 多于模版 run，多余 run 保留现有格式；
+    # 若模版 run 多于输出 run，多余模版 run 忽略。
+    if not out_para.runs:
+        return
+
+    for out_idx, out_run in enumerate(out_para.runs):
+        if out_idx >= len(tpl_para.runs):
+            break
+
+        tpl_run = tpl_para.runs[out_idx]
+        tpl_rPr = tpl_run._element.find(qn('w:rPr'))
+
+        # 从模版 run 提取字体/大小信息
+        tpl_rFonts = tpl_rPr.find(qn('w:rFonts')) if tpl_rPr is not None else None
+        tpl_sz = tpl_rPr.find(qn('w:sz')) if tpl_rPr is not None else None
+        tpl_szCs = tpl_rPr.find(qn('w:szCs')) if tpl_rPr is not None else None
+
+        out_rPr = out_run._element.find(qn('w:rPr'))
+        if out_rPr is None:
+            out_rPr = etree.SubElement(out_run._element, qn('w:rPr'))
+            out_run._element.insert(0, out_rPr)
+
+        # 保存输出 run 的粗体标记（Markdown 语义，模版 run 的粗体不覆盖输出）
+        saved_b = out_rPr.find(qn('w:b'))
+        saved_bCs = out_rPr.find(qn('w:bCs'))
+        had_bold = (
+            (saved_b is not None and saved_b.get(qn('w:val')) != '0')
+            or (saved_bCs is not None and saved_bCs.get(qn('w:val')) != '0')
+        )
+
+        # 复制/清除字体名称：模版有则复制，模版无则清除输出以继承样式
+        if tpl_rFonts is not None:
+            out_rFonts = out_rPr.find(qn('w:rFonts'))
+            if out_rFonts is None:
+                out_rFonts = etree.SubElement(out_rPr, qn('w:rFonts'))
+                out_rPr.insert(0, out_rFonts)
+            for attr in ('eastAsia', 'ascii', 'hAnsi', 'cs'):
+                val = tpl_rFonts.get(qn(f'w:{attr}'))
+                if val:
+                    out_rFonts.set(qn(f'w:{attr}'), val)
+        else:
+            out_rFonts = out_rPr.find(qn('w:rFonts'))
+            if out_rFonts is not None:
+                out_rPr.remove(out_rFonts)
+
+        # 复制/清除字号：模版有则复制，模版无则清除输出以继承样式
+        if tpl_sz is not None:
+            out_sz = out_rPr.find(qn('w:sz'))
+            if out_sz is None:
+                out_sz = etree.SubElement(out_rPr, qn('w:sz'))
+            out_sz.set(qn('w:val'), tpl_sz.get(qn('w:val')))
+        else:
+            out_sz = out_rPr.find(qn('w:sz'))
+            if out_sz is not None:
+                out_rPr.remove(out_sz)
+
+        if tpl_szCs is not None:
+            out_szCs = out_rPr.find(qn('w:szCs'))
+            if out_szCs is None:
+                out_szCs = etree.SubElement(out_rPr, qn('w:szCs'))
+            out_szCs.set(qn('w:val'), tpl_szCs.get(qn('w:val')))
+        else:
+            out_szCs = out_rPr.find(qn('w:szCs'))
+            if out_szCs is not None:
+                out_rPr.remove(out_szCs)
+
+        # 恢复输出原有的粗体标记
+        if had_bold and saved_b is None:
+            etree.SubElement(out_rPr, qn('w:b'))
+        # else: 粗体标记已存在或不需要，不做改动
+
+
+def _copy_cell_width(tpl_cell, out_cell):
+    """从模版单元格复制宽度到输出单元格。
+
+    Args:
+        tpl_cell: 模版 python-docx Cell 对象
+        out_cell: 输出 python-docx Cell 对象
+    """
+    from docx.oxml.ns import qn
+    from lxml import etree
+
+    tpl_tcPr = tpl_cell._tc.find(qn('w:tcPr'))
+    out_tcPr = out_cell._tc.find(qn('w:tcPr'))
+
+    if tpl_tcPr is None or out_tcPr is None:
+        return
+
+    tpl_tcW = tpl_tcPr.find(qn('w:tcW'))
+    if tpl_tcW is not None:
+        out_tcW = out_tcPr.find(qn('w:tcW'))
+        if out_tcW is None:
+            out_tcW = etree.SubElement(out_tcPr, qn('w:tcW'))
+        for attr_name, attr_val in tpl_tcW.attrib.items():
+            out_tcW.set(attr_name, attr_val)
+
+
+def _copy_table_format(tpl_table, out_table):
+    """从模版表格复制格式到输出表格。
+
+    复制表格样式、边框、列宽、布局设置，
+    以及每个单元格的段落/run 格式。
+
+    Args:
+        tpl_table: 模版 python-docx Table 对象
+        out_table: 输出 python-docx Table 对象
+    """
+    from docx.oxml.ns import qn
+    from lxml import etree
+    from copy import deepcopy
+
+    tpl_tbl = tpl_table._tbl
+    out_tbl = out_table._tbl
+
+    # ── 表格级属性 ──
+    tpl_tblPr = tpl_tbl.find(qn('w:tblPr'))
+    out_tblPr = out_tbl.find(qn('w:tblPr'))
+
+    if tpl_tblPr is not None and out_tblPr is not None:
+        # 表格样式 w:tblStyle
+        tpl_tblStyle = tpl_tblPr.find(qn('w:tblStyle'))
+        if tpl_tblStyle is not None:
+            out_tblStyle = out_tblPr.find(qn('w:tblStyle'))
+            if out_tblStyle is None:
+                out_tblStyle = etree.SubElement(out_tblPr, qn('w:tblStyle'))
+                out_tblPr.insert(0, out_tblStyle)
+            out_tblStyle.set(qn('w:val'), tpl_tblStyle.get(qn('w:val')))
+
+        # 表格宽度 w:tblW
+        tpl_tblW = tpl_tblPr.find(qn('w:tblW'))
+        if tpl_tblW is not None:
+            out_tblW = out_tblPr.find(qn('w:tblW'))
+            if out_tblW is None:
+                out_tblW = etree.SubElement(out_tblPr, qn('w:tblW'))
+            for attr_name, attr_val in tpl_tblW.attrib.items():
+                out_tblW.set(attr_name, attr_val)
+
+        # 表格对齐 w:jc（OOXML 中表格居中对齐元素位于 w:tblPr/w:jc）
+        tpl_jc = tpl_tblPr.find(qn('w:jc'))
+        if tpl_jc is not None:
+            out_jc = out_tblPr.find(qn('w:jc'))
+            if out_jc is None:
+                out_jc = etree.Element(qn('w:jc'))
+                # 按 Word schema 顺序插入：紧跟 w:tblW 之后
+                anchor = out_tblPr.find(qn('w:tblW'))
+                if anchor is not None:
+                    anchor.addnext(out_jc)
+                else:
+                    out_tblPr.insert(0, out_jc)
+            out_jc.set(qn('w:val'), tpl_jc.get(qn('w:val')))
+
+        # 表格布局 w:tblLayout
+        tpl_tblLayout = tpl_tblPr.find(qn('w:tblLayout'))
+        if tpl_tblLayout is not None:
+            out_tblLayout = out_tblPr.find(qn('w:tblLayout'))
+            if out_tblLayout is None:
+                out_tblLayout = etree.SubElement(out_tblPr, qn('w:tblLayout'))
+            for attr_name, attr_val in tpl_tblLayout.attrib.items():
+                out_tblLayout.set(attr_name, attr_val)
+
+        # 表格边框 w:tblBorders（深拷贝整个边框元素）
+        tpl_tblBorders = tpl_tblPr.find(qn('w:tblBorders'))
+        if tpl_tblBorders is not None:
+            out_tblBorders = out_tblPr.find(qn('w:tblBorders'))
+            if out_tblBorders is not None:
+                out_tblPr.remove(out_tblBorders)
+            out_tblPr.append(deepcopy(tpl_tblBorders))
+
+    # ── 列宽：从模版 tblGrid 复制 ──
+    tpl_tblGrid = tpl_tbl.find(qn('w:tblGrid'))
+    out_tblGrid = out_tbl.find(qn('w:tblGrid'))
+    if tpl_tblGrid is not None and out_tblGrid is not None:
+        tpl_cols = tpl_tblGrid.findall(qn('w:gridCol'))
+        out_cols = out_tblGrid.findall(qn('w:gridCol'))
+        for i, tpl_col in enumerate(tpl_cols):
+            if i < len(out_cols):
+                w = tpl_col.get(qn('w:w'))
+                if w is not None:
+                    out_cols[i].set(qn('w:w'), w)
+
+    # ── 单元格级格式 ──
+    for row_idx in range(min(len(tpl_table.rows), len(out_table.rows))):
+        tpl_row = tpl_table.rows[row_idx]
+        out_row = out_table.rows[row_idx]
+
+        for col_idx in range(min(len(tpl_row.cells), len(out_row.cells))):
+            tpl_cell = tpl_row.cells[col_idx]
+            out_cell = out_row.cells[col_idx]
+
+            # 复制单元格宽度
+            _copy_cell_width(tpl_cell, out_cell)
+
+            # 设置垂直居中
+            _set_cell_vertical_alignment(out_cell, 'center')
+
+            # 复制每个段落格式：跳过模版单元格中的空白(间距)段落，
+            # 按"内容段落"位置匹配（输出 HTML 表格单元格恒为单段落）
+            tpl_paras = [p for p in tpl_cell.paragraphs if p.text.strip()]
+            out_paras = out_cell.paragraphs
+            for p_idx in range(min(len(tpl_paras), len(out_paras))):
+                _copy_paragraph_format(tpl_paras[p_idx], out_paras[p_idx])
+
+
+def _copy_template_formatting(output_path, template_path,
+                              copy_paragraphs=True, copy_tables=True):
+    """从模版 docx 复制格式到输出 docx 的对应元素。
+
+    按 body 元素顺序进行位置匹配——模版中的空白间距段落会被跳过，
+    因此输出元素 N 会匹配到模版中第 N 个内容承载元素。
+
+    Args:
+        output_path: pandoc 输出的 .docx 文件路径（原地修改）
+        template_path: 模版 .docx 文件路径
+        copy_paragraphs: 是否复制段落格式
+        copy_tables: 是否复制表格格式
+    """
+    _check_pydocx()
+    from docx import Document
+
+    out_doc = Document(output_path)
+    tpl_doc = Document(template_path)
+
+    tpl_elements = _get_content_elements(tpl_doc)
+    out_elements = _get_content_elements(out_doc)
+
+    for i, out_elem in enumerate(out_elements):
+        if i >= len(tpl_elements):
+            break
+        tpl_elem = tpl_elements[i]
+
+        if (out_elem['type'] == 'paragraph' and tpl_elem['type'] == 'paragraph'
+                and copy_paragraphs):
+            _copy_paragraph_format(tpl_elem['para'], out_elem['para'])
+        elif (out_elem['type'] == 'table' and tpl_elem['type'] == 'table'
+                and copy_tables):
+            _copy_table_format(tpl_elem['table'], out_elem['table'])
+
+    out_doc.save(output_path)
+
+
+def post_process_docx(output_path, format_spec=None, reference_docx_path=None):
     """
     对 pandoc 生成的 DOCX 进行轻量后处理，修正东亚字体设置与图片排版。
 
@@ -1031,9 +1419,14 @@ def post_process_docx(output_path, format_spec=None):
     该样式设置了固定值 28 磅行距，会导致大尺寸图片被裁剪至 28 磅高度，
     造成图片被文字遮挡。本函数将图片段落的行距改为单倍行距以完整显示图片。
 
+    当指定 reference_docx_path 时，会从模版文档复制格式到输出文档，
+    并跳过表格单元格的强制格式化，以保持模版中的个性化表格样式。
+
     Args:
         output_path: 要后处理的 .docx 文件路径
         format_spec: 格式规范字典（由 get_format_spec() 返回）
+        reference_docx_path: 模版 .docx 文件路径。指定后从模版复制格式，
+            并跳过表格单元格的强制格式化。
     """
     _check_pydocx()
     from docx import Document
@@ -1095,55 +1488,62 @@ def post_process_docx(output_path, format_spec=None):
     # 解决方案：将包含图片的段落行距改为单倍行距（自动扩展以容纳图片）。
     _fix_image_paragraph_spacing(doc, format_spec)
 
-    # 表格单元格：清理多余空格、水平居中、垂直居中，确保字体为仿宋_GB2312 五号
-    for table in doc.tables:
-        # ── 表格尺寸：根据窗口和内容自动调整 ──
-        _set_table_autofit_window(table)
+    # ── 表格格式处理 ──
+    if reference_docx_path:
+        # 有模版：先复制段落格式（表格此时尚未插入，仅复制段落）
+        doc.save(output_path)
+        _copy_template_formatting(output_path, reference_docx_path,
+                                  copy_paragraphs=True, copy_tables=False)
+    else:
+        # 无模版：应用公文标准表格格式
+        for table in doc.tables:
+            # ── 表格尺寸：根据窗口和内容自动调整 ──
+            _set_table_autofit_window(table)
 
-        for row in table.rows:
-            for cell in row.cells:
-                # 设置单元格垂直居中
-                _set_cell_vertical_alignment(cell, 'center')
+            for row in table.rows:
+                for cell in row.cells:
+                    # 设置单元格垂直居中
+                    _set_cell_vertical_alignment(cell, 'center')
 
-                for paragraph in cell.paragraphs:
-                    # 设置段落水平居中
-                    paragraph.alignment = _get_alignment_enum('center')
+                    for paragraph in cell.paragraphs:
+                        # 设置段落水平居中
+                        paragraph.alignment = _get_alignment_enum('center')
 
-                    # 清除首行缩进（防止从 Normal 样式继承 2 字符缩进）
-                    pPr = paragraph._element.find(qn('w:pPr'))
-                    if pPr is not None:
-                        _clear_first_line_indent(pPr)
+                        # 清除首行缩进（防止从 Normal 样式继承 2 字符缩进）
+                        pPr = paragraph._element.find(qn('w:pPr'))
+                        if pPr is not None:
+                            _clear_first_line_indent(pPr)
 
-                    # 清理段落中所有 run 的文本多余空格
-                    for run in paragraph.runs:
-                        if run.text:
-                            # 合并连续空白字符，去除首尾空白
-                            cleaned = re.sub(r'\s+', ' ', run.text).strip()
-                            run.text = cleaned
+                        # 清理段落中所有 run 的文本多余空格
+                        for run in paragraph.runs:
+                            if run.text:
+                                # 合并连续空白字符，去除首尾空白
+                                cleaned = re.sub(r'\s+', ' ', run.text).strip()
+                                run.text = cleaned
 
-                    # 表格单元格内段落可能没有应用 Compact 样式
-                    for run in paragraph.runs:
-                        rPr = run._element.find(qn('w:rPr'))
-                        if rPr is None:
-                            continue
+                        # 表格单元格内段落可能没有应用 Compact 样式
+                        for run in paragraph.runs:
+                            rPr = run._element.find(qn('w:rPr'))
+                            if rPr is None:
+                                continue
 
-                        # 修正东亚字体
-                        rFonts = rPr.find(qn('w:rFonts'))
-                        if rFonts is None:
-                            rFonts = etree.SubElement(rPr, qn('w:rFonts'))
-                            rPr.insert(0, rFonts)
-                        rFonts.set(qn('w:eastAsia'), DEFAULT_FONT)
+                            # 修正东亚字体
+                            rFonts = rPr.find(qn('w:rFonts'))
+                            if rFonts is None:
+                                rFonts = etree.SubElement(rPr, qn('w:rFonts'))
+                                rPr.insert(0, rFonts)
+                            rFonts.set(qn('w:eastAsia'), DEFAULT_FONT)
 
-                        # 修正字号为五号 (10.5pt)
-                        sz = rPr.find(qn('w:sz'))
-                        sz_cs = rPr.find(qn('w:szCs'))
-                        target_sz = '21'  # 10.5pt = 21 half-pts
-                        if sz is not None:
-                            sz.set(qn('w:val'), target_sz)
-                        if sz_cs is not None:
-                            sz_cs.set(qn('w:val'), target_sz)
+                            # 修正字号为五号 (10.5pt)
+                            sz = rPr.find(qn('w:sz'))
+                            sz_cs = rPr.find(qn('w:szCs'))
+                            target_sz = '21'  # 10.5pt = 21 half-pts
+                            if sz is not None:
+                                sz.set(qn('w:val'), target_sz)
+                            if sz_cs is not None:
+                                sz_cs.set(qn('w:val'), target_sz)
 
-    doc.save(output_path)
+        doc.save(output_path)
 
 
 # ──────────────────────────────────────────────
@@ -1277,11 +1677,24 @@ def convert_md_to_docx(
     # ── 后处理：修正东亚字体 ──
     if not skip_format:
         print("后处理：修正东亚字体与表格格式...")
-        post_process_docx(output_path, format_spec)
+        post_process_docx(
+            output_path,
+            format_spec,
+            reference_docx_path=reference_docx if reference_docx else None,
+        )
 
     # ── 后处理：插入 HTML 表格 ──
     if html_tables:
         _insert_html_tables(output_path, html_tables, format_spec)
+
+    # ── 后处理：从模版复制表格格式（必须在 HTML 表格插入之后） ──
+    if not skip_format and reference_docx and os.path.exists(reference_docx):
+        _copy_template_formatting(
+            output_path,
+            reference_docx,
+            copy_paragraphs=False,
+            copy_tables=True,
+        )
 
     # 清理临时文件
     if temp_md is not None:
