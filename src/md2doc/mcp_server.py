@@ -21,6 +21,12 @@ from md2doc.converter import (
     PandocTimeoutError,
     convert,
 )
+from md2doc.xlsx_converter import (
+    XlsxConversionError,
+    InputFileNotFoundError as XlsxInputFileNotFoundError,
+    NoTableFoundError,
+    convert_markdown_to_xlsx as _convert_md_to_xlsx,
+)
 from md2doc.analyzer import analyze
 
 # ── Configurable default format spec path ─────────────────────────────
@@ -52,6 +58,7 @@ After conversion completes, ask the user whether they also want to generate a mo
 
 ## Available tools
 - **convert_markdown_to_docx**: Convert .md to .docx with Chinese government document formatting (公文格式). Supports custom format specs, reference templates, media extraction, and optional auto-generation of modification suggestions.
+- **convert_markdown_to_xlsx**: Convert .md to .xlsx (Excel). Extracts every HTML <table> and Markdown pipe table, one worksheet per table, preserving merged cells (colspan/rowspan), inline bold, and alignment. Styled with 微软雅黑 font, thin borders, bold header row.
 - **analyze_and_suggest**: Analyze a Markdown document's structure and content, generating a structured modification suggestions report (xx-修改建议.md) covering heading hierarchy, required sections, format issues, content problems, list continuity, and Chinese punctuation.
 """,
 )
@@ -168,6 +175,81 @@ def convert_markdown_to_docx(
         except Exception as e:
             parts.append("")
             parts.append(f"⚠️ 自动生成修改建议失败: {type(e).__name__}: {e}")
+
+    return "\n".join(parts)
+
+
+@mcp.tool()
+def convert_markdown_to_xlsx(
+    input_path: str,
+    output_path: str | None = None,
+    font_name: str | None = None,
+    body_size: int | None = None,
+) -> str:
+    """Convert Markdown tables to an Excel (.xlsx) file.
+
+    Extracts every HTML <table> and Markdown pipe table from the document
+    (in document order) and writes each to its own worksheet. Preserves
+    colspan/rowspan merged cells, inline <b> bold, and text-align alignment.
+
+    Styling:
+    - Font: 微软雅黑 (11pt body), thin borders on all cells
+    - Header cells (HTML <th> or the first row of a pipe table): bold + light gray fill
+    - All cells: vertical center, wrap text
+    - Column widths and row heights estimated from content
+
+    Args:
+        input_path: Absolute path to the input Markdown file.
+        output_path: Output .xlsx path. Defaults to <input_dir>/<input_stem>.xlsx.
+        font_name: Optional font name override (default 微软雅黑).
+        body_size: Optional body font size override (default 11).
+
+    Returns:
+        Summary string with input path, output path, file size, and sheet count.
+    """
+    try:
+        result_path = _convert_md_to_xlsx(
+            input_path=input_path,
+            output_path=output_path,
+            font_name=font_name,
+            body_size=body_size,
+        )
+    except XlsxInputFileNotFoundError as e:
+        return f"错误：输入文件不存在 — {e}"
+    except NoTableFoundError as e:
+        return f"错误：未找到表格 — {e}"
+    except XlsxConversionError as e:
+        return f"错误：转换失败 — {e}"
+    except Exception as e:
+        return f"未知错误: {type(e).__name__}: {e}"
+
+    size_bytes = result_path.stat().st_size
+    if size_bytes >= 1_000_000:
+        size_str = f"{size_bytes / 1_000_000:.1f} MB"
+    elif size_bytes >= 1_000:
+        size_str = f"{size_bytes / 1_000:.1f} KB"
+    else:
+        size_str = f"{size_bytes} bytes"
+
+    try:
+        import openpyxl
+        wb = openpyxl.load_workbook(result_path, read_only=True)
+        sheet_count = len(wb.sheetnames)
+        sheets = "、".join(wb.sheetnames)
+        wb.close()
+    except Exception:
+        sheet_count = 0
+        sheets = ""
+
+    parts = [
+        "✅ 转换成功",
+        f"输入文件: {input_path}",
+        f"输出文件: {result_path}",
+        f"文件大小: {size_str}",
+        f"工作表:   {sheet_count} 个",
+    ]
+    if sheets:
+        parts.append(f"Sheet 名: {sheets}")
 
     return "\n".join(parts)
 

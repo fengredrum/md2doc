@@ -11,6 +11,7 @@
 - 自动处理东亚字体、图片行距、表格自动适配
 - **MCP Server**：可在 Claude Code 中直接调用转换和分析工具
 - **语义分析**：检查文档结构和内容，生成修改建议报告
+- **Markdown → Excel**：将文档中的 HTML/管道表格转换为带样式的 `.xlsx`（微软雅黑、细边框、合并单元格、自动列宽行高）
 
 ## 安装
 
@@ -146,7 +147,35 @@ md2doc 提供 MCP（Model Context Protocol）服务器，可在 Claude Code 中�
 >
 > Claude：*调用 convert_markdown_to_docx，format_spec="custom-format.md"*
 
-#### 2. analyze_and_suggest — 文档语义分析
+#### 2. convert_markdown_to_xlsx — 转换 Markdown 为 Excel
+
+将 Markdown 文档中的表格转换为带样式的 `.xlsx` 文件。按文档顺序提取所有 HTML `<table>` 与 Markdown 管道表格，**每个表格生成一个 worksheet**。
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `input_path` | string | ✓ | 输入的 Markdown 文件绝对路径 |
+| `output_path` | string | | 输出 .xlsx 路径，默认为 `<输入目录>/<文件名>.xlsx` |
+| `font_name` | string | | 字体名（默认微软雅黑） |
+| `body_size` | int | | 正文字号（默认 11） |
+
+**保留的格式**：
+
+- HTML 表格：`colspan`/`rowspan` 合并单元格、`<b>` 粗体、`<th>` 表头、`<br>` 换行、`style` 中的 `text-align` 对齐
+- 管道表格：首行为表头；分隔行 `:---` / `---:` / `:---:` 决定列对齐
+- 样式：微软雅黑、细边框、表头加粗 + 浅灰底纹、垂直居中、自动换行、按内容估算列宽与行高
+- Sheet 名取表格前最近的 `#` 标题，否则为 `表格N`
+
+**使用示例对话**：
+
+> 用户：把这个课程大纲 md 转成 Excel
+>
+> Claude：*调用 convert_markdown_to_xlsx，自动生成 .xlsx*
+
+> 用户：帮我把 report.md 里所有表格导出成 xlsx
+>
+> Claude：*调用 convert_markdown_to_xlsx，输出每个表格一个 sheet*
+
+#### 3. analyze_and_suggest — 文档语义分析
 
 分析 Markdown 文档的结构和内容，在同目录下生成 `xx-修改建议.md` 修改建议报告。
 
@@ -221,17 +250,18 @@ DEFAULT_FORMAT_SPEC_PATH: str | None = str(
 ```
 md2doc/
 ├── scripts/
-│   └── md2docx.py          # CLI 转换脚本（独立运行）
+│   ├── md2docx.py          # Markdown → Word CLI 转换脚本（独立运行）
+│   └── md2xlsx.py          # Markdown → Excel CLI 转换脚本（独立运行）
 ├── src/md2doc/
 │   ├── __init__.py          # 包元数据
-│   ├── converter.py         # 核心转换包装器（异常驱动的 API）
+│   ├── converter.py         # Markdown → Word 核心包装器（异常驱动的 API）
+│   ├── xlsx_converter.py    # Markdown → Excel 核心包装器（异常驱动的 API）
 │   ├── analyzer.py          # 语义分析引擎
 │   └── mcp_server.py        # MCP 服务器入口
 ├── 格式要求.md               # 默认公文格式规范
 ├── 测试用例/                 # 测试文档
-│   ├── 测试文档.md
-│   ├── 模板.docx
-│   └── images/
+│   ├── AI场景落地全流程实战.md
+│   └── 模版.xlsx
 └── pyproject.toml
 ```
 
